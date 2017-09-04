@@ -9,11 +9,17 @@ require 'mysql2-cs-bind'
 require 'rack/utils'
 require 'sinatra/base'
 require 'tilt/erubis'
+require 'rack-mini-profiler'
+require 'rack-lineprof'
+require 'pry'
+require 'sinatra/reloader'
 
 module Isuda
   class Web < ::Sinatra::Base
     enable :protection
     enable :sessions
+    use Rack::MiniProfiler if ENV['DEBUG'] == 'true'
+    use Rack::Lineprof, profile: 'web.rb'
     set :erb, escape_html: true
     set :public_folder, File.expand_path('../../../../public', __FILE__)
     set :db_user, ENV['ISUDA_DB_USER'] || 'root'
@@ -24,14 +30,8 @@ module Isuda
     set :isutar_origin, ENV['ISUTAR_ORIGIN'] || 'http://localhost:5001'
 
     configure :development do
-      require 'rack-mini-profiler'
-      require 'rack-lineprof'
-      require 'pry'
-      require 'sinatra/reloader'
 
       register Sinatra::Reloader
-      use Rack::MiniProfiler
-      use Rack::Lineprof
     end
 
     set(:set_name) do |value|
