@@ -13,13 +13,13 @@ require 'rack-mini-profiler'
 require 'rack-lineprof'
 require 'pry'
 require 'sinatra/reloader'
+require 'redis'
 
 module Isuda
   class Web < ::Sinatra::Base
     enable :protection
     enable :sessions
-    use Rack::MiniProfiler if ENV['DEBUG'] == 'true'
-    use Rack::Lineprof, profile: 'web.rb'
+
     set :erb, escape_html: true
     set :public_folder, File.expand_path('../../../../public', __FILE__)
     set :db_user, ENV['ISUDA_DB_USER'] || 'root'
@@ -30,6 +30,7 @@ module Isuda
     set :isutar_origin, ENV['ISUTAR_ORIGIN'] || 'http://localhost:5001'
 
     configure :development do
+      require 'sinatra/reloader'
 
       register Sinatra::Reloader
     end
@@ -53,6 +54,12 @@ module Isuda
     end
 
     helpers do
+      def redis
+  Thread.current[:redis] ||=
+    begin
+    redis = Redis.new(:path => "/var/run/redis/redis.sock")
+    end
+  end
       def db
         Thread.current[:db] ||=
           begin
@@ -71,14 +78,20 @@ module Isuda
       end
 
       def register(name, pw)
-        chars = [*'A'..'~']
-        salt = 1.upto(20).map { chars.sample }.join('')
-        salted_password = encode_with_salt(password: pw, salt: salt)
-        db.xquery(%|
-          INSERT INTO user (name, salt, password, created_at)
-          VALUES (?, ?, ?, NOW())
-        |, name, salt, salted_password)
-        db.last_id
+        #chars = [*'A'..'~']
+        #salt = 1.upto(20).map { chars.sample }.join('')
+  salt = "aaa"
+        #salted_password = encode_with_salt(password: pw, salt: salt)
+  newid = redis.incr("USER_NEW_ID")
+  redis.set("USER_#{name}_password", pw)
+  #redis.set("USER_#{name}_salt", salt)
+  redis.set("USER_#{name}_id", newid)
+        #db.xquery(%|
+        #  INSERT INTO user (name, salt, password, created_at)
+        #  VALUES (?, ?, ?, NOW())
+        #|, name, salt, salted_password)
+        #db.last_id
+  newid
       end
 
       def encode_with_salt(password: , salt: )
@@ -93,12 +106,12 @@ module Isuda
         ! validation['valid']
       end
 
-      def htmlify(content)
-        keywords = db.xquery(%| select * from entry order by character_length(keyword) desc |)
-        pattern = keywords.map {|k| Regexp.escape(k[:keyword]) }.join('|')
+      def htmlify(content,re)
+        #keywords = db.xquery(%| select keyword from entry order by character_length(keyword) desc |)
+        #pattern = keywords.map {|k| Regexp.escape(k[:keyword]) }.join('|')
         kw2hash = {}
-        hashed_content = content.gsub(/(#{pattern})/) {|m|
-          matched_keyword = $1
+        hashed_content = content.gsub(re) {|m|
+          matched_keyword = m
           "isuda_#{Digest::SHA1.hexdigest(matched_keyword)}".tap do |hash|
             kw2hash[matched_keyword] = hash
           end
@@ -132,6 +145,8 @@ module Isuda
 
     get '/initialize' do
       db.xquery(%| DELETE FROM entry WHERE id > 7101 |)
+      redis.flushall
+      system('/usr/bin/redis-cli < /home/isucon/webapp/ruby/userinfo.redis > /dev/null')
       isutar_initialize_url = URI(settings.isutar_origin)
       isutar_initialize_url.path = '/initialize'
       Net::HTTP.get_response(isutar_initialize_url)
@@ -151,8 +166,20 @@ module Isuda
         OFFSET #{per_page * (page - 1)}
       |)
       entries.each do |entry|
-        entry[:html] = htmlify(entry[:description])
-        entry[:stars] = load_stars(entry[:keyword])
+        keyesc = Rack::Utils.escape_path(entry[:keyword])
+        data = redis.get("key_"+keyesc)
+  if data == nil
+            unless @re
+                keywords = db.xquery(%| select keyword from entry order by character_length(keyword) desc |)
+                pattern = keywords.map {|k| Regexp.escape(k[:keyword]) }.join('|')
+                @re = Regexp.new(pattern)
+            end
+      data = htmlify(entry[:description],@re)
+            redis.set("key_"+keyesc,data)
+      redis.set(Rack::Utils.escape_path(entry[:description]),keyesc)
+  end
+  entry[:stars] = redis.lrange "star:#{entry[:keyword]}",0,-1
+  entry[:html] = data
       end
 
       total_entries = db.xquery(%| SELECT count(*) AS total_entries FROM entry |).first[:total_entries].to_i
@@ -182,6 +209,7 @@ module Isuda
     post '/register' do
       name = params[:name] || ''
       pw   = params[:password] || ''
+      #puts "register #{name} #{pw}"
       halt(400) if (name == '') || (pw == '')
 
       user_id = register(name, pw)
@@ -199,12 +227,23 @@ module Isuda
 
     post '/login' do
       name = params[:name]
-      user = db.xquery(%| select * from user where name = ? |, name).first
-      halt(403) unless user
-      halt(403) unless user[:password] == encode_with_salt(password: params[:password], salt: user[:salt])
-
+      user = {}
+      user[:id] = redis.get("USER_#{params[:name]}_id")
+  if user[:id] 
+    #puts "redis hit"
+    halt(403) unless params[:password] == params[:name]
+  else
+    #puts "mysql query"
+    user = db.xquery(%| select * from user where name = ? |, name).first
+          halt(403) unless user
+          halt(403) unless user[:password] == encode_with_salt(password: params[:password], salt: user[:salt])
+    redis.set("USER_#{name}_password", params[:password])
+    redis.set("USER_#{name}_id", user[:id])
+  end
+#      user[:password] = redis.get("USER_#{params[:name]}_password")
+#      user[:salt] = Base64.decode64(redis.get("USER_#{params[:name]}_salt"))
+#      halt(403) unless user[:password] == encode_with_salt(password: params[:password], salt: user[:salt])
       session[:user_id] = user[:id]
-
       redirect_found '/'
     end
 
@@ -226,16 +265,34 @@ module Isuda
         ON DUPLICATE KEY UPDATE
         author_id = ?, keyword = ?, description = ?, updated_at = NOW()
       |, *bound)
-
+      keyesc = Rack::Utils.escape_path(keyword)
+      redis.scan_each(:match => "*"+keyesc+"*") do |key|
+        kw=redis.get(key)
+        if kw != nil && redis.exists("key_"+kw)
+    redis.del(key)
+    redis.del("key_"+kw)
+        end
+      end
       redirect_found '/'
+
     end
 
     get '/keyword/:keyword', set_name: true do
       keyword = params[:keyword] or halt(400)
 
       entry = db.xquery(%| select * from entry where keyword = ? |, keyword).first or halt(404)
-      entry[:stars] = load_stars(entry[:keyword])
-      entry[:html] = htmlify(entry[:description])
+      entry[:stars] = redis.lrange "star:#{keyword}",0,-1
+       keyesc = Rack::Utils.escape_path(entry[:keyword])
+       data = redis.get("key_"+keyesc)
+       if data == nil
+               keywords = db.xquery(%| select keyword from entry order by character_length(keyword) desc |)
+               pattern = keywords.map {|k| Regexp.escape(k[:keyword]) }.join('|')
+               re = Regexp.new(pattern)
+               data = htmlify(entry[:description],re)
+               redis.set("key_"+keyesc,data)
+               redis.set(Rack::Utils.escape_path(entry[:description]),keyesc)
+       end
+       entry[:html] = data
 
       locals = {
         entry: entry,

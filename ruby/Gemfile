@@ -10,6 +10,7 @@ gem 'unicorn'
 gem 'rack-lineprof'
 gem 'rack-mini-profiler'
 gem 'pry-byebug'
+gem 'redis'
 
 
 group :development do
